@@ -1,0 +1,6 @@
+numpy
+scipy
+wfdb
+torch
+matplotlib
+coremltools>=8
