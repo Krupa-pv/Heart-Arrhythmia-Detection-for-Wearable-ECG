@@ -4,3 +4,4 @@ wfdb
 torch
 matplotlib
 coremltools>=8
+scikit-learn
