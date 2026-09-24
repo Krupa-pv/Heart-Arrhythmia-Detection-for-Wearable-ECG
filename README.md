@@ -7,8 +7,8 @@ converted to Core ML so the enrollment can run on an iPhone.
 
 **Research prototype, not a medical device.**
 
-Status: v1 (Python result + Core ML parity) done. v2 (Swift enrollment on iPhone, device latency,
-compressed re-run) in progress.
+Status: v1 (Python result + Core ML parity) done. Swift prototype head done and matches Python.
+v2 (iPhone latency, compressed re-run) in progress.
 
 ## The leakage trap
 
@@ -104,6 +104,30 @@ with each method's own baseline and ceiling.
 
 - FP32 ML Program vs PyTorch on all DS2 beats: max logit difference 1.3e-5, argmax agreement 100%.
 - Embedding model for the phone: FP16 61.4 KB, 6-bit palettized 31.7 KB.
+
+## Swift prototype head
+
+`swift/ProtoHead` is a Swift package with the on-device part: `EmbeddingModel` runs the Core ML
+embedding model one beat at a time, and `ProtoHead` appends the 4 RR values, does the at-rest
+enrollment (N prototype blended toward the enrollment mean) and classifies by nearest prototype.
+The `replay` tool feeds it a MIT-BIH record exported by `replay.py`, so this is a **replayed**
+record, not a live sensor.
+
+```
+python replay.py export --rec 214
+swift build -c release --package-path swift/ProtoHead
+swift/ProtoHead/.build/release/replay runs/replay/214.json runs/coreml/ecg_embedding_fp16.mlpackage \
+    runs/enroll/proto_constants.json runs/replay/214_swift.json
+python replay.py check --rec 214
+```
+
+Checked on all 22 DS2 records (FP16 model, CPU, on a Mac):
+- Swift embeddings = coremltools embeddings exactly.
+- Swift head vs Python head on the same embeddings: 100% same predictions.
+- End to end vs the PyTorch path in `enroll.py`: 10 of 41,459 test beats differ (FP16 rounding),
+  per-record macro-F1 within 0.001.
+
+iPhone latency is not measured yet.
 
 ## What broke
 
