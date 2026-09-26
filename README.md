@@ -128,10 +128,11 @@ Checked on all 22 DS2 records (FP16 model, CPU, on a Mac):
   per-record macro-F1 within 0.001.
 
 On the iPhone (`ios/ECGReplay`, a one-button app using the same package, record 214 bundled
-in the app): same per-class results as the Mac, and `replay.py check` on the phone's output gives
-the same three results (embeddings identical, head 100%, 1 beat off from PyTorch).
-Enrollment on the phone, 76 beats (60 s) embedded + N prototype update: **6.3 ms**.
-Model load 127 ms, about 0.07 ms per beat. Full latency benchmark per compute unit still to do.
+in the app):
+- CPU only: `replay.py check` on the phone's saved output gives the same three results as the Mac
+  (embeddings identical, head 100%, 1 beat off from PyTorch).
+- All compute units: same per-class results as the Mac (N 1613/1662, V 156/212). Enrollment,
+  76 beats (60 s) embedded + N prototype update: **6.3 ms**. Model load 127 ms, about 0.07 ms per beat. Full latency benchmark per compute unit still to do.
 
 ## What broke
 
