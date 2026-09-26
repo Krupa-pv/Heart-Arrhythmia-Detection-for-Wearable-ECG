@@ -127,7 +127,7 @@ Checked on all 22 DS2 records (FP16 model, CPU, on a Mac):
 - End to end vs the PyTorch path in `enroll.py`: 10 of 41,459 test beats differ (FP16 rounding),
   per-record macro-F1 within 0.001.
 
-On the iPhone (`ios/ECGReplay`, a one-button app using the same package, record 214 bundled
+On the iPhone (iPhone 15 Pro, iOS 26.6.2; `ios/ECGReplay`, a one-button app using the same package, record 214 bundled
 in the app):
 - CPU only: `replay.py check` on the phone's saved output gives the same three results as the Mac
   (embeddings identical, head 100%, 1 beat off from PyTorch).
