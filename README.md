@@ -2,21 +2,32 @@
 
 A heartbeat classifier trained on other people's hearts does worse on a new person's heart.
 This project measures that gap on MIT-BIH with a proper inter-patient split, then tests whether a
-short per-patient enrollment, using no cardiologist labels, closes part of it. The model is
-converted to Core ML so the enrollment can run on an iPhone.
+short per-patient enrollment, using no cardiologist labels, closes part of it, and runs that
+enrollment on an iPhone with Core ML.
 
-**Research prototype, not a medical device.**
+**Research prototype, not a medical device.** Everything on the phone is a **replayed** MIT-BIH
+record, not a live sensor.
 
-Status: v1 (Python result + Core ML parity) done. Swift prototype head done and matches Python.
-v2 (iPhone latency, compressed re-run) in progress.
+## Results at a glance
 
-## The leakage trap
+| | |
+|---|---|
+| Population model on unseen patients (DS2) | macro-F1 0.407 |
+| 60 s enrollment, no labels, prototype head | **+0.074 macro-F1**, 77% of the recoverable gap |
+| 60 s enrollment, no labels, head fine-tune | −0.030 (hurts, see below) |
+| Same enrollment with the 6-bit model | +0.071, 74% of the gap |
+| Enrollment on iPhone 15 Pro (60 s of beats) | **6.3 ms** |
+| Inference per beat on iPhone 15 Pro | about 0.04 ms, FP16 and 6-bit |
+| Model size | about 62 KB FP16, 32 KB 6-bit |
+| Swift / Core ML vs Python | same predictions (differences only from FP16 rounding) |
+
+## The problem and the leakage trap
 
 If you split MIT-BIH beats at random, the same patient ends up in train and test and you score
 around 99%. That number measures memorizing patients, not generalizing. Here the split is the
 de Chazal inter-patient one: DS1 records train, DS2 records test, no record in both. Paced records
 (102, 104, 107, 217) are left out. The numbers below are lower than the random-split ones you see
-around, and that's expected.
+around, and that's the point.
 
 ## Setup
 
@@ -29,13 +40,7 @@ around, and that's expected.
   [embedding, RR]. Weighted cross-entropy (1/√count).
 - Epoch picked on 4 held-out DS1 patients (106, 118, 124, 223). DS2 is never used to choose anything.
 - Metric: macro-F1 over N, S, V, F (Q has 7 beats in DS2), plus per-class sensitivity and PPV.
-
-```
-python prep.py      # download + preprocess
-python train.py     # Step A
-python enroll.py    # Step B
-python convert.py   # Core ML (macOS)
-```
+  Never accuracy: 89% of beats are N.
 
 ## Step A: the gap
 
@@ -58,7 +63,8 @@ For each DS2 patient, enroll on the first 30 s / 60 s / 2 min / 5 min, and test 
 after 5 min. The test beats are the same for every length, and enrollment beats never touch them.
 
 Two methods, backbone frozen in both:
-- **Fine-tune:** plain SGD on the linear head only (what `MLUpdateTask` can do on device).
+- **Fine-tune:** plain full-batch SGD on the linear head only, 30 steps, no regularizer (exactly
+  what `MLUpdateTask` can do on device).
 - **Prototype head:** class prototypes = class means of [embedding, RR] on DS1 train, scaled by
   DS1 std. Enrollment blends the prototypes toward the patient's mean with weight α, then
   classify by nearest prototype. α picked on DS1 val patients (0.5).
@@ -78,61 +84,66 @@ with each method's own baseline and ceiling.
 | Prototype, population | 0.402 | | 0.908 | 0.084 | |
 | Prototype, realistic | 0.476 | **+0.074** | 0.874 | 0.057 | 77% |
 | Prototype, oracle 5 min (ceiling) | 0.499 | +0.097 | 0.945 | 0.139 | 100% |
+| Prototype, random labels | 0.368 | −0.034 | 0.895 | 0.138 | |
 | Fine-tune, population | 0.411 | | 0.853 | 0.094 | |
 | Fine-tune, realistic | 0.380 | −0.030 | 0.350 | 0.054 | −14% |
 | Fine-tune, oracle 5 min (ceiling) | 0.628 | +0.217 | 0.835 | 0.646 | 100% |
 | Fine-tune, random labels | 0.255 | −0.156 | 0.810 | 0.172 | |
-| Prototype, random labels | 0.368 | −0.034 | 0.895 | 0.138 | |
+
+`enroll.py` also prints every condition with record 232 left out (reporting only, nothing is
+chosen on it). The prototype gain holds without it: +0.071.
 
 ![enrollment curve](figures/enrollment_curve.png)
 
 ![per patient at 60 s](figures/per_patient_60s.png)
 
-## What surprised me
+## On the phone
 
-- **Label-free enrollment helps the prototype head and hurts fine-tuning.** Fine-tuning on
-  all-N labels teaches the head to call everything N, and V sensitivity falls from 0.85 to 0.35.
-  Moving only the N prototype doesn't have that problem.
-- **The prototype gain is fewer false alarms, not more arrhythmias found.** V PPV goes from 0.50 to
-  0.89, and S sensitivity actually drops a bit. The 77% is of a small ceiling (+0.097), so +0.074
-  macro-F1 is the more honest number.
-- **The prototype curve is flat from 30 s to 5 min.** 30 seconds of beats already gives the N mean.
-- **One record drives the fine-tune ceiling.** Without 232, the oracle fine-tune S sensitivity is
-  0.197, below the population model's 0.331. Most of the oracle's S gain is learning 232.
+Everything on-device lives in `swift/ProtoHead`, a Swift package used by both a Mac command line
+tool (for checking against Python) and the iPhone app in `ios/ECGReplay`.
 
-## Core ML
+### Core ML conversion
 
 - FP32 ML Program vs PyTorch on all DS2 beats: max logit difference 1.3e-5, argmax agreement 100%.
-- Embedding model for the phone: FP16 61.4 KB, 6-bit palettized 31.7 KB.
+- The phone gets only the **embedding** model (backbone), FP16 and 6-bit palettized.
+  The head runs in Swift (prototype) or as a separate updatable model (fine-tune).
 
-## Swift prototype head
+### Prototype head (adapted on-device)
 
-`swift/ProtoHead` is a Swift package with the on-device part: `EmbeddingModel` runs the Core ML
-embedding model one beat at a time, and `ProtoHead` appends the 4 RR values, does the at-rest
-enrollment (N prototype blended toward the enrollment mean) and classifies by nearest prototype.
-The `replay` tool feeds it a MIT-BIH record exported by `replay.py`, so this is a **replayed**
-record, not a live sensor.
+`EmbeddingModel` runs the Core ML embedding model one beat at a time, and `ProtoHead` appends the
+4 RR values, does the at-rest enrollment (N prototype blended toward the enrollment mean) and
+classifies by nearest prototype.
 
-```
-python replay.py export --rec 214
-swift build -c release --package-path swift/ProtoHead
-swift/ProtoHead/.build/release/replay runs/replay/214.json runs/coreml/ecg_embedding_fp16.mlpackage \
-    runs/enroll/proto_constants.json runs/replay/214_swift.json
-python replay.py check --rec 214
-```
-
-Checked on all 22 DS2 records (FP16 model, CPU, on a Mac):
+Checked on all 22 DS2 records on a Mac (FP16, CPU):
 - Swift embeddings = coremltools embeddings exactly.
 - Swift head vs Python head on the same embeddings: 100% same predictions.
 - End to end vs the PyTorch path in `enroll.py`: 10 of 41,459 test beats differ (FP16 rounding),
   per-record macro-F1 within 0.001.
 
-On the iPhone (iPhone 15 Pro, iOS 26.6.2; `ios/ECGReplay`, a one-button app using the same package, record 214 bundled
-in the app):
-- CPU only: `replay.py check` on the phone's saved output gives the same three results as the Mac
-  (embeddings identical, head 100%, 1 beat off from PyTorch).
-- All compute units: same per-class results as the Mac (N 1613/1662, V 156/212). Enrollment,
-  76 beats (60 s) embedded + N prototype update: **6.3 ms**. Model load 127 ms, about 0.07 ms per beat.
+On an iPhone 15 Pro (iOS 26.6.2), record 214 bundled in the app:
+- CPU only: `replay.py check` on the phone's saved output gives the same three results as the Mac.
+- All compute units: same per-class results (N 1613/1662, V 156/212). Enrollment, 76 beats (60 s)
+  embedded + N prototype update: **6.3 ms**. Model load 127 ms.
+
+### Head fine-tune with `MLUpdateTask`
+
+`MLUpdateTask` only works on the old NeuralNetwork format, so `updatable.py` builds the head
+(Linear 68 → 5, softmax) as a NeuralNetwork with only the linear layer updatable, cross-entropy
+loss and plain SGD. Swift (`UpdatableHead`) runs it full batch, 30 steps, lr 0.01, same as
+`enroll.py`. The backbone stays in the ML Program embedding model.
+
+Checked on all 22 DS2 records on a Mac, realistic@60 and oracle@300:
+- Updated weights, Core ML vs PyTorch on the same features: max difference 6e-8 (the update
+  itself moves them by about 0.1).
+- Predictions on the same features: identical, 0 differences.
+- End to end vs `enroll.py`: 25 of about 83,000 test predictions differ (FP16 embeddings),
+  macro-F1 within 0.004.
+- Update time on the Mac: about 30 ms for 60 s of beats, 120 ms for 5 min.
+
+On the iPhone: *pending.*
+
+It works, but it's the method that doesn't help without labels (−0.030 at 60 s), so the
+prototype head is still the one to ship.
 
 ### Latency (Xcode performance report, iPhone 15 Pro, iOS 26.6.2, batch 1)
 
@@ -147,13 +158,7 @@ Predict time per beat, median / p95 over 120 predictions (40 x 3 runs):
 
 Model load is about 6.5-6.8 ms in every case.
 
-Every op is listed as supported on the Neural Engine, but in all four settings, including
-forced CPU + Neural Engine and CPU + GPU, Core ML placed all 17 ops on the CPU, for both
-models. The model is tiny (one beat, 4 small convs), so the scheduler decides the CPU is
-cheapest. So there's no Neural Engine number for this model: it runs on the CPU in about
-0.04 ms per beat whatever you ask for. 6-bit halves the size and doesn't change speed.
-
-## Does it survive compression?
+### Does it survive compression?
 
 `compressed.py` embeds every DS2 beat with the FP16 and 6-bit Core ML models (batch 1, CPU),
 then runs the prototype head with the same constants the phone ships (made from the FP32 model).
@@ -165,14 +170,59 @@ Each variant gets its own population baseline and oracle@300 ceiling.
 | Core ML FP16 | 62.9 KB | 0.402 | 0.476 | +0.074 | 76.8% | 0.499 |
 | Core ML 6-bit | 32.5 KB | 0.406 | 0.477 | +0.071 | 73.5% | 0.503 |
 
-FP16 is effectively identical. 6-bit moves embeddings by up to 0.24 but the enrollment gain
-barely changes (+0.071 vs +0.074), so half the size costs almost nothing here.
+## What surprised me
+
+- **Label-free enrollment helps the prototype head and hurts fine-tuning.** Fine-tuning on
+  all-N labels teaches the head to call everything N, and V sensitivity falls from 0.85 to 0.35.
+  Moving only the N prototype doesn't have that problem.
+- **The prototype gain is fewer false alarms, not more arrhythmias found.** V PPV goes from 0.50 to
+  0.89, and S sensitivity actually drops a bit. The 77% is of a small ceiling (+0.097), so +0.074
+  macro-F1 is the more honest number.
+- **The prototype curve is flat from 30 s to 5 min.** 30 seconds of beats already gives the N mean.
+- **One record drives the fine-tune ceiling.** Without 232, the oracle fine-tune S sensitivity is
+  0.197, below the population model's 0.331. Most of the oracle's S gain is learning 232.
+- **The Neural Engine never gets used.** Every op is supported on it, but in all four settings,
+  including forced CPU + Neural Engine and CPU + GPU, Core ML placed all 17 ops on the CPU for
+  both models. The model is small enough that the scheduler decides the CPU is cheapest, so
+  there's no Neural Engine number for it.
+- **6-bit is free here.** It halves the size, moves embeddings by up to 0.24, and barely changes the
+  enrollment gain (+0.071 vs +0.074) or the speed.
 
 ## What broke
 
 - PhysioNet returned a 502 halfway through the download, and the prep script only checked for one
   file, so a rerun skipped the download and crashed. Now it checks all records.
 - 6-bit palettization needs scikit-learn (k-means), which wasn't in the requirements.
+- `MLUpdateTask` refused full-batch training: the model spec only allowed the mini-batch size it
+  was built with, and the number of enrollment beats is different for every patient. Fixed by
+  allowing a range (1-4096) in the spec.
+- A `data/` line in `.gitignore` also matched the `Data/` folder inside `.mlpackage` bundles
+  (macOS paths are case-insensitive), so the model weights silently didn't get committed.
+
+## Running it
+
+```
+pip install -r requirements.txt
+python prep.py         # download MIT-BIH + preprocess
+python train.py        # Step A
+python enroll.py       # Step B
+python convert.py      # Core ML + parity (macOS)
+python compressed.py   # FP16 vs 6-bit enrollment
+python updatable.py    # updatable head for MLUpdateTask
+
+# Swift checks against Python (macOS)
+swift build -c release --package-path swift/ProtoHead
+python replay.py export --rec 214
+swift/ProtoHead/.build/release/replay runs/replay/214.json runs/coreml/ecg_embedding_fp16.mlpackage \
+    runs/enroll/proto_constants.json runs/replay/214_swift.json
+python replay.py check --rec 214
+swift/ProtoHead/.build/release/finetune runs/replay/214.json runs/coreml/ecg_embedding_fp16.mlpackage \
+    runs/coreml/ecg_head_updatable.mlmodel runs/replay/214_finetune.json
+python replay.py finetune --rec 214
+```
+
+The iPhone app is `ios/ECGReplay`. It needs `214.json` (from `replay.py export`, not in the repo)
+added to the app target.
 
 ## Prior work
 
