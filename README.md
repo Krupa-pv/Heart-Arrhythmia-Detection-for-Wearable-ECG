@@ -132,17 +132,26 @@ in the app):
 - CPU only: `replay.py check` on the phone's saved output gives the same three results as the Mac
   (embeddings identical, head 100%, 1 beat off from PyTorch).
 - All compute units: same per-class results as the Mac (N 1613/1662, V 156/212). Enrollment,
-  76 beats (60 s) embedded + N prototype update: **6.3 ms**. Model load 127 ms, about 0.07 ms per beat. ### Latency (Xcode performance report, iPhone 15 Pro, iOS 26.6.2, batch 1)
+  76 beats (60 s) embedded + N prototype update: **6.3 ms**. Model load 127 ms, about 0.07 ms per beat.
 
-| Model | Size | Compute units | Predict median / p95 | Load |
-|---|---|---|---|---|
-| FP16 | 62.9 KB | All | 0.040 / 0.062 ms | 6.8 ms |
-| 6-bit palettized | 32.5 KB | All | 0.039 / 0.062 ms | 6.7 ms |
+### Latency (Xcode performance report, iPhone 15 Pro, iOS 26.6.2, batch 1)
 
-With "All", Core ML runs every op on the CPU for both models, even though all 17 ops are
-supported on the Neural Engine. The model is small enough that dispatching to the Neural Engine
-isn't worth it. 6-bit halves the size but doesn't change latency. Forced CPU+Neural Engine,
-CPU-only and CPU+GPU runs still to do.
+Predict time per beat, median / p95 over 120 predictions (40 x 3 runs):
+
+| Compute units | FP16 (62.9 KB) | 6-bit palettized (32.5 KB) |
+|---|---|---|
+| All | 0.040 / 0.062 ms | 0.039 / 0.062 ms |
+| CPU only | 0.044 / 0.067 ms | 0.042 / 0.070 ms |
+| CPU + GPU | 0.044 / 0.061 ms | 0.045 / 0.064 ms |
+| CPU + Neural Engine | 0.042 / 0.066 ms | 0.045 / 0.072 ms |
+
+Model load is about 6.5-6.8 ms in every case.
+
+Every op is listed as supported on the Neural Engine, but in all four settings, including
+forced CPU + Neural Engine and CPU + GPU, Core ML placed all 17 ops on the CPU, for both
+models. The model is tiny (one beat, 4 small convs), so the scheduler decides the CPU is
+cheapest. So there's no Neural Engine number for this model: it runs on the CPU in about
+0.04 ms per beat whatever you ask for. 6-bit halves the size and doesn't change speed.
 
 ## Does it survive compression?
 
