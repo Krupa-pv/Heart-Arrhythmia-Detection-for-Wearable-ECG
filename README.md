@@ -132,7 +132,17 @@ in the app):
 - CPU only: `replay.py check` on the phone's saved output gives the same three results as the Mac
   (embeddings identical, head 100%, 1 beat off from PyTorch).
 - All compute units: same per-class results as the Mac (N 1613/1662, V 156/212). Enrollment,
-  76 beats (60 s) embedded + N prototype update: **6.3 ms**. Model load 127 ms, about 0.07 ms per beat. Full latency benchmark per compute unit still to do.
+  76 beats (60 s) embedded + N prototype update: **6.3 ms**. Model load 127 ms, about 0.07 ms per beat. ### Latency (Xcode performance report, iPhone 15 Pro, iOS 26.6.2, batch 1)
+
+| Model | Size | Compute units | Predict median / p95 | Load |
+|---|---|---|---|---|
+| FP16 | 62.9 KB | All | 0.040 / 0.062 ms | 6.8 ms |
+| 6-bit palettized | 32.5 KB | All | 0.039 / 0.062 ms | 6.7 ms |
+
+With "All", Core ML runs every op on the CPU for both models, even though all 17 ops are
+supported on the Neural Engine. The model is small enough that dispatching to the Neural Engine
+isn't worth it. 6-bit halves the size but doesn't change latency. Forced CPU+Neural Engine,
+CPU-only and CPU+GPU runs still to do.
 
 ## What broke
 
