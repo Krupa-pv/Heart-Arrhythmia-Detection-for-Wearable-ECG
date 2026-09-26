@@ -144,6 +144,21 @@ supported on the Neural Engine. The model is small enough that dispatching to th
 isn't worth it. 6-bit halves the size but doesn't change latency. Forced CPU+Neural Engine,
 CPU-only and CPU+GPU runs still to do.
 
+## Does it survive compression?
+
+`compressed.py` embeds every DS2 beat with the FP16 and 6-bit Core ML models (batch 1, CPU),
+then runs the prototype head with the same constants the phone ships (made from the FP32 model).
+Each variant gets its own population baseline and oracle@300 ceiling.
+
+| Variant | Size | Population | Realistic 60 s | Change | Recovered | Oracle 5 min |
+|---|---|---|---|---|---|---|
+| PyTorch FP32 | | 0.402 | 0.476 | +0.074 | 76.7% | 0.499 |
+| Core ML FP16 | 62.9 KB | 0.402 | 0.476 | +0.074 | 76.8% | 0.499 |
+| Core ML 6-bit | 32.5 KB | 0.406 | 0.477 | +0.071 | 73.5% | 0.503 |
+
+FP16 is effectively identical. 6-bit moves embeddings by up to 0.24 but the enrollment gain
+barely changes (+0.071 vs +0.074), so half the size costs almost nothing here.
+
 ## What broke
 
 - PhysioNet returned a 502 halfway through the download, and the prep script only checked for one
