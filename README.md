@@ -16,7 +16,7 @@ record, not a live sensor.
 | 60 s enrollment, no labels, prototype head | **+0.074 macro-F1**, 77% of the recoverable gap |
 | 60 s enrollment, no labels, head fine-tune | −0.030 (hurts, see below) |
 | Same enrollment with the 6-bit model | +0.071, 74% of the gap |
-| Enrollment on iPhone 15 Pro (60 s of beats) | **6.3 ms** |
+| Enrollment on iPhone 15 Pro (60 s of beats) | **6.3 ms** prototype, 25 ms `MLUpdateTask` fine-tune |
 | Inference per beat on iPhone 15 Pro | about 0.04 ms, FP16 and 6-bit |
 | Model size | about 62 KB FP16, 32 KB 6-bit |
 | Swift / Core ML vs Python | same predictions (differences only from FP16 rounding) |
@@ -140,7 +140,10 @@ Checked on all 22 DS2 records on a Mac, realistic@60 and oracle@300:
   macro-F1 within 0.004.
 - Update time on the Mac: about 30 ms for 60 s of beats, 120 ms for 5 min.
 
-On the iPhone: *pending.*
+On an iPhone 15 Pro (iOS 26.6.2), record 214: `replay.py finetune` on the phone's saved output
+gives the same results as the Mac (weights within 6e-8 of PyTorch, predictions identical, macro-F1
+equal to `enroll.py`). The update itself takes **25.4 ms** for 60 s of beats (76) and 70 ms for
+5 min (383), 30 SGD steps each, so the head is **trained on-device**.
 
 It works, but it's the method that doesn't help without labels (−0.030 at 60 s), so the
 prototype head is still the one to ship.
