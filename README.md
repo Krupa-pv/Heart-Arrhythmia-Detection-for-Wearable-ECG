@@ -127,7 +127,11 @@ Checked on all 22 DS2 records (FP16 model, CPU, on a Mac):
 - End to end vs the PyTorch path in `enroll.py`: 10 of 41,459 test beats differ (FP16 rounding),
   per-record macro-F1 within 0.001.
 
-iPhone latency is not measured yet.
+On the iPhone (`ios/ECGReplay`, a one-button app using the same package, record 214 bundled
+in the app): same per-class results as the Mac, and `replay.py check` on the phone's output gives
+the same three results (embeddings identical, head 100%, 1 beat off from PyTorch).
+Enrollment on the phone, 76 beats (60 s) embedded + N prototype update: **6.3 ms**.
+Model load 127 ms, about 0.07 ms per beat. Full latency benchmark per compute unit still to do.
 
 ## What broke
 

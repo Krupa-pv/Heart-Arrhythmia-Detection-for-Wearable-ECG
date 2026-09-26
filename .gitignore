@@ -4,3 +4,8 @@ data/
 mitdb/
 runs/
 .build/
+ios/**/214.json
+xcuserdata/
+.DS_Store
+.swiftpm/
+*.xcappdata/
