@@ -9,6 +9,11 @@ check:  compare swift output with python
 run: python replay.py export --rec 214
      swift run -c release --package-path swift/ProtoHead replay runs/replay/214.json ...
      python replay.py check --rec 214
+
+finetune: same idea for the MLUpdateTask head (swift finetune tool writes <rec>_finetune.json)
+  1. updated fc weights, core ml vs pytorch finetune() on the same features
+  2. predictions after the update, same features
+  3. vs the pytorch-embedding path in enroll.py (finetune/realistic@60, finetune/oracle@300)
 """
 import argparse
 import json
@@ -17,7 +22,7 @@ import os
 import numpy as np
 import torch
 
-from enroll import embed, proto_enroll, proto_pred, split_patient
+from enroll import embed, finetune as pt_finetune, head_pred, proto_enroll, proto_pred, split_patient
 from metrics import report
 from model import BeatNet
 from train import load, subset
@@ -86,9 +91,48 @@ def check(a):
     print(f"   macro-F1  swift {f_sw:.4f}   python {f_pt:.4f}   enroll.py results.json {ref:.4f}")
 
 
+def check_finetune(a):
+    ds2 = load(f"{a.data}/ds2.npz")
+    d = subset(ds2, ds2["rec"] == a.rec)
+    sw = json.load(open(f"{a.out}/{a.rec}_finetune.json"))
+    enroll_all, test = split_patient(ds2, a.rec)
+    off = np.flatnonzero(ds2["rec"] == a.rec)[0]
+    test = test - off
+    assert sw["test_idx"] == test.tolist(), "swift picked different test beats"
+    y = d["y"][test]
+
+    model = BeatNet()
+    model.load_state_dict(torch.load(a.ckpt, map_location="cpu"))
+    z_sw = torch.from_numpy(np.concatenate([np.array(sw["embedding"], np.float32), d["rr"]], 1))
+    z_pt = embed(model, d, "cpu")
+    yt = torch.from_numpy(d["y"])
+    res = json.load(open(a.results))["per_patient"]
+
+    p_pop = head_pred(model.head, z_sw[test])
+    print(f"population  core ml vs pytorch head, same features: {(np.array(sw['population']) == p_pop).mean():.5f} agree")
+    for name, T, oracle in [("realistic@60", 60, False), ("oracle@300", 300, True)]:
+        e = enroll_all[T] - off
+        labels = yt[e] if oracle else torch.zeros(len(e), dtype=torch.long)
+        h = pt_finetune(model.head, z_sw[e], labels, 30, 0.01)
+        w_pt = h.fc.weight.detach().numpy().ravel()
+        w_cm = np.array(sw["conds"][name]["weights"], np.float32)
+        p_cm = np.array(sw["conds"][name]["pred"])
+        p_same = head_pred(h, z_sw[test])
+        h2 = pt_finetune(model.head, z_pt[e], labels, 30, 0.01)
+        p_pt = head_pred(h2, z_pt[test])
+        ref = res[f"finetune/{name}"][str(a.rec)]["macro_f1"]
+        print(f"{name}: update took {sw['conds'][name]['seconds'] * 1000:.1f} ms on {len(e)} beats")
+        print(f"  1. weights    core ml vs pytorch, same features: max |diff| {np.abs(w_cm - w_pt).max():.2e}"
+              f"  (weights moved by {np.abs(w_pt - model.head.fc.weight.detach().numpy().ravel()).max():.2e})")
+        print(f"  2. preds      same features: {(p_cm == p_same).mean():.5f} agree ({(p_cm != p_same).sum()} differ)")
+        print(f"  3. end to end vs pytorch embeddings: {(p_cm == p_pt).mean():.5f} agree ({(p_cm != p_pt).sum()} differ)")
+        print(f"     macro-F1  core ml {report(y, p_cm)['macro_f1']:.4f}   pytorch {report(y, p_pt)['macro_f1']:.4f}"
+              f"   enroll.py {ref:.4f}")
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["export", "check"])
+    ap.add_argument("cmd", choices=["export", "check", "finetune"])
     ap.add_argument("--rec", type=int, default=214)
     ap.add_argument("--data", default="data")
     ap.add_argument("--out", default="runs/replay")
@@ -97,7 +141,7 @@ def main():
     ap.add_argument("--ckpt", default="runs/baseline/model.pt")
     ap.add_argument("--mlpackage", default="runs/coreml/ecg_embedding_fp16.mlpackage")
     a = ap.parse_args()
-    export(a) if a.cmd == "export" else check(a)
+    {"export": export, "check": check, "finetune": check_finetune}[a.cmd](a)
 
 
 if __name__ == "__main__":

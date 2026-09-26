@@ -9,5 +9,7 @@ let package = Package(
         .target(name: "ProtoHead"),
         // mac only tool that replays a MIT-BIH record exported by replay.py
         .executableTarget(name: "replay", dependencies: ["ProtoHead"]),
+        // mac only, checks MLUpdateTask fine-tune against python
+        .executableTarget(name: "finetune", dependencies: ["ProtoHead"]),
     ]
 )

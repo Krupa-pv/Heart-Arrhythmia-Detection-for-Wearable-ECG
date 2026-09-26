@@ -7,6 +7,11 @@ struct Output: Codable {
     let rec: Int; let enroll_idx: [Int]; let test_idx: [Int]; let pred: [Int]
     let embedding: [[Float]]; let prototypes_after: [[Float]]
 }
+// same format as the mac finetune tool, so replay.py finetune can check it
+struct Cond: Codable { let pred: [Int]; let weights: [Float]; let seconds: Double }
+struct FinetuneOutput: Codable {
+    let rec: Int; let test_idx: [Int]; let embedding: [[Float]]; let population: [Int]; let conds: [String: Cond]
+}
 
 struct ContentView: View {
     @State private var log = "tap run"
@@ -20,6 +25,13 @@ struct ContentView: View {
                 Task {
                     await Task.yield()
                     do { log = try replay() } catch { log = "error: \(error)" }
+                }
+            }
+            Button("Run MLUpdateTask fine-tune, record 214") {
+                log = "running..."
+                Task {
+                    await Task.yield()
+                    do { log = try await finetune() } catch { log = "error: \(error)" }
                 }
             }
             ScrollView { Text(log).font(.system(.footnote, design: .monospaced)) }
@@ -79,5 +91,41 @@ struct ContentView: View {
             s += "\(head.constants.classes[c]): \(correct[c])/\(total[c]) correct\n"
         }
         return s + "saved 214_swift.json to Documents"
+    }
+
+    // last-layer fine-tune on the phone: realistic@60 (all N) and oracle@300, 30 SGD steps
+    func finetune() async throws -> String {
+        let r = try JSONDecoder().decode(Record.self, from: Data(contentsOf: file("214", "json")))
+        let model = try EmbeddingModel(url: file("ecg_embedding_fp16", "mlmodelc"), computeUnits: .cpuOnly)
+        let head = try UpdatableHead(url: file("ecg_head_updatable", "mlmodelc"))
+
+        let emb = try r.x.map { try model.embed($0) }
+        let feats = zip(emb, r.rr).map { ProtoHead.features(embedding: $0, rr: $1) }
+        let t0 = r.t.min()!
+        let testIdx = r.t.indices.filter { r.t[$0] >= t0 + 300 }
+        let base = try head.baseModel()
+        let population = try testIdx.map { try UpdatableHead.classify(base, feats[$0]) }
+
+        var s = "record \(r.rec), MLUpdateTask on the head, tested on \(testIdx.count) beats\n"
+        var conds: [String: Cond] = [:]
+        for (name, secs, oracle) in [("realistic@60", Float(60), false), ("oracle@300", Float(300), true)] {
+            let idx = r.t.indices.filter { r.t[$0] < t0 + secs }
+            let clock = ContinuousClock()
+            let start = clock.now
+            let m = try await head.finetune(features: idx.map { feats[$0] }, labels: idx.map { oracle ? r.y[$0] : 0 })
+            let took = clock.now - start
+            let pred = try testIdx.map { try UpdatableHead.classify(m, feats[$0]) }
+            conds[name] = Cond(pred: pred, weights: try UpdatableHead.weights(m), seconds: ms(took) / 1000)
+
+            var correct = [Int](repeating: 0, count: 5), total = correct
+            for (i, p) in zip(testIdx, pred) { total[r.y[i]] += 1; if p == r.y[i] { correct[r.y[i]] += 1 } }
+            s += String(format: "\n%@: update %.1f ms on %d beats\n", name, ms(took), idx.count)
+            for c in 0..<5 where total[c] > 0 { s += "  \(["N", "S", "V", "F", "Q"][c]): \(correct[c])/\(total[c]) correct\n" }
+        }
+        let out = FinetuneOutput(rec: r.rec, test_idx: testIdx, embedding: emb, population: population, conds: conds)
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        try JSONEncoder().encode(out).write(to: docs.appendingPathComponent("214_finetune.json"))
+        s += "\nmac got: realistic@60 N 1660/1662 V 128/212, oracle@300 N 1655/1662 V 138/212\n"
+        return s + "saved 214_finetune.json to Documents"
     }
 }
