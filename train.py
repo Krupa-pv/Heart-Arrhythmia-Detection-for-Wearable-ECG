@@ -42,6 +42,17 @@ def tensors(d, dev):
             torch.from_numpy(d["y"]).to(dev))
 
 
+def augment(x, max_shift=8, scale=0.2, noise=0.05):
+    """random shift (edge padded), amplitude scale and noise per beat, so the CNN can't just
+    memorize the exact shape of the training patients' beats"""
+    b, n = x.shape
+    s = torch.randint(-max_shift, max_shift + 1, (b, 1), device=x.device)
+    idx = (torch.arange(n, device=x.device)[None] + s).clamp(0, n - 1)
+    x = x.gather(1, idx)
+    x = x * (1 + scale * (2 * torch.rand(b, 1, device=x.device) - 1))
+    return x + noise * torch.randn_like(x)
+
+
 @torch.no_grad()
 def predict(model, d, dev, bs=4096):
     model.eval()
@@ -50,39 +61,48 @@ def predict(model, d, dev, bs=4096):
                       for i in range(0, len(x), bs)]).cpu().numpy()
 
 
-def fit(tr, dev, epochs, va=None, ckpt=None, seed=0):
-    """trains BeatNet. if va is given keeps best epoch by val macro-F1, otherwise the last one"""
+def fit(tr, dev, epochs, va=None, ckpt=None, seed=0, weights="sqrt", aug=False, dropout=0.0,
+        select="val", on_epoch=None):
+    """trains BeatNet. select=val keeps the best epoch by val macro-F1, select=last keeps the last
+    one (val still reported). on_epoch(ep, model) gets called after every epoch, used by cv.py"""
     torch.manual_seed(seed)
     np.random.seed(seed)
     counts = np.bincount(tr["y"], minlength=5).astype(float)
-    w = 1 / np.sqrt(np.maximum(counts, 1))
-    w = w / w.sum() * 5  # 1/sqrt(count), plain 1/count pushes Q and F way too hard
+    if weights == "inv":
+        w = 1 / np.maximum(counts, 1)
+    else:
+        w = 1 / np.sqrt(np.maximum(counts, 1))
+    w = w / w.sum() * 5  # default 1/sqrt(count), plain 1/count pushes Q and F way too hard
     loss_fn = nn.CrossEntropyLoss(weight=torch.tensor(w, dtype=torch.float32, device=dev))
 
-    model = BeatNet().to(dev)
+    model = BeatNet(dropout).to(dev)
     opt = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
     x, rr, y = tensors(tr, dev)
 
-    best, best_ep = -1.0, epochs - 1
+    best, best_ep, best_rep = -1.0, epochs - 1, None
     for ep in range(epochs):
         model.train()
         perm = torch.randperm(len(y), device=dev)
         for i in range(0, len(y), 256):
             idx = perm[i:i + 256]
             opt.zero_grad()
-            loss_fn(model(x[idx], rr[idx]), y[idx]).backward()
+            xb = augment(x[idx]) if aug else x[idx]
+            loss_fn(model(xb, rr[idx]), y[idx]).backward()
             opt.step()
+        if on_epoch:
+            on_epoch(ep, model)
         if va is not None:
-            f1 = report(va["y"], predict(model, va, dev))["macro_f1"]
+            rep = report(va["y"], predict(model, va, dev))
+            f1 = rep["macro_f1"]
             print(f"epoch {ep:2d}  val macro-F1 {f1:.3f}")
-            if f1 > best:
-                best, best_ep = f1, ep
+            if select == "last" or f1 > best:
+                best, best_ep, best_rep = f1, ep, rep
                 torch.save(model.state_dict(), ckpt)
     if va is not None:
         model.load_state_dict(torch.load(ckpt))
     elif ckpt:
         torch.save(model.state_dict(), ckpt)
-    return model, best_ep, best
+    return model, best_ep, best, best_rep
 
 
 def main():
@@ -91,15 +111,28 @@ def main():
     ap.add_argument("--out", default="runs/baseline")
     ap.add_argument("--epochs", type=int, default=40)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--weights", choices=["sqrt", "inv"], default="sqrt")
+    ap.add_argument("--no-test", action="store_true", help="don't touch DS2, for picking settings")
+    ap.add_argument("--aug", action="store_true")
+    ap.add_argument("--dropout", type=float, default=0.0)
+    ap.add_argument("--select", choices=["val", "last"], default="val",
+                    help="val = best epoch on val patients, last = fixed --epochs (picked by cv.py)")
     a = ap.parse_args()
 
     dev = get_device()
     os.makedirs(a.out, exist_ok=True)
-    ds1, ds2 = load(f"{a.data}/ds1.npz"), load(f"{a.data}/ds2.npz")
+    ds1 = load(f"{a.data}/ds1.npz")
     is_val = np.isin(ds1["rec"], VAL_RECS)
 
-    model, best_ep, best = fit(subset(ds1, ~is_val), dev, a.epochs,
-                               va=subset(ds1, is_val), ckpt=f"{a.out}/model.pt", seed=a.seed)
+    model, best_ep, best, val_rep = fit(subset(ds1, ~is_val), dev, a.epochs, va=subset(ds1, is_val),
+                                        ckpt=f"{a.out}/model.pt", seed=a.seed, weights=a.weights,
+                                        aug=a.aug, dropout=a.dropout, select=a.select)
+    json.dump({"best_epoch": best_ep, "val": val_rep, "args": vars(a)},
+              open(f"{a.out}/val_results.json", "w"), indent=1)
+    if a.no_test:
+        print(f"\nbest epoch {best_ep}  (val macro-F1 {best:.3f})\nDS1 val:\n" + fmt(val_rep))
+        return
+    ds2 = load(f"{a.data}/ds2.npz")
 
     p = predict(model, ds2, dev)
     overall = report(ds2["y"], p)

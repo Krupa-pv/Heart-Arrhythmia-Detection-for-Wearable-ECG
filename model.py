@@ -33,12 +33,13 @@ class Head(nn.Module):
 
 
 class BeatNet(nn.Module):
-    def __init__(self):
+    def __init__(self, dropout=0.0):
         super().__init__()
         self.backbone, self.head = Backbone(), Head()
+        self.drop = nn.Dropout(dropout)  # only on while training, no weights so old checkpoints still load
 
     def forward(self, x, rr):
-        return self.head(torch.cat([self.backbone(x), rr], 1))
+        return self.head(torch.cat([self.drop(self.backbone(x)), rr], 1))
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 .venv/
 __pycache__/
 /data/
+/data_norm/
 /mitdb/
 /runs/
 .build/
