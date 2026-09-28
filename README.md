@@ -138,8 +138,13 @@ leads; we use MLII only.
 **What this means for enrollment.** On the better v3 CNN, 60 s of label-free prototype enrollment
 adds only +0.036 (0.400 → 0.436), and the enrolled prototype head no longer beats the plain linear
 head (0.442). A good part of v2's +0.074 was undoing v2's own overtraining (false alarms on N
-beats), not patient differences. Combining enrollment with the timing model, and moving v3 to
-the phone, is not done yet: everything under "On the phone" is still v2.
+beats), not patient differences. Combining enrollment with the timing model is not done yet.
+
+**v3 on the phone.** `V3Classifier` in `swift/ProtoHead` runs the v3 Core ML embedding model, the
+CNN's last layer and the timing model in Swift (`fusion.py --export` writes the constants). On a
+Mac it matches Python on all 22 DS2 records (0 disagreements on the same embeddings, 6 of 49,668
+beats off end to end from FP16, per-record macro-F1 within 0.0007). On the iPhone 15 Pro, record
+214 gives identical predictions to the Mac. The rest of "On the phone" below is v2.
 
 ## On the phone
 
