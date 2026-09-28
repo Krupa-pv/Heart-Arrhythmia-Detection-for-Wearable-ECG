@@ -11,5 +11,7 @@ let package = Package(
         .executableTarget(name: "replay", dependencies: ["ProtoHead"]),
         // mac only, checks MLUpdateTask fine-tune against python
         .executableTarget(name: "finetune", dependencies: ["ProtoHead"]),
+        // mac only, checks v3 (CNN + timing model) against python
+        .executableTarget(name: "v3", dependencies: ["ProtoHead"]),
     ]
 )

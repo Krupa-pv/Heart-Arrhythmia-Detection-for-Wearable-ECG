@@ -97,17 +97,35 @@ def test(a):
     json.dump(out, open(f"{a.out}/ds2.json", "w"), indent=1, default=float)
 
 
+def export(a):
+    """everything swift needs for v3 besides the Core ML embedding model"""
+    from model import BeatNet
+    m = BeatNet()
+    m.load_state_dict(torch.load(a.ckpts[0], map_location="cpu"))
+    rr = json.load(open(f"{a.out}/ds2.json"))["rr_model"]
+    assert rr["features"] == "norm", "swift side expects the 4 normalized RR features"
+    c = {"head_weight": m.head.fc.weight.detach().tolist(), "head_bias": m.head.fc.bias.detach().tolist(),
+         "rr_mean": rr["mean"], "rr_scale": rr["scale"], "rr_coef": rr["coef"],
+         "rr_intercept": rr["intercept"], "w": rr["w"], "classes": ["N", "S", "V", "F", "Q"]}
+    json.dump(c, open(f"{a.out}/v3_constants.json", "w"))
+    print(f"wrote {a.out}/v3_constants.json")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--seeds", type=int, nargs="+", default=[0])
     ap.add_argument("--epochs", type=int, default=4)  # v3, picked by cv.py
     ap.add_argument("--out", default="runs/fusion")
     ap.add_argument("--test", action="store_true", help="final DS2 check with --pick and --ckpts")
+    ap.add_argument("--export", action="store_true",
+                    help="write v3_constants.json for swift: CNN head weights (first --ckpts) + timing model")
     ap.add_argument("--pick", default="norm/multi/w=3")
     ap.add_argument("--ckpts", nargs="+", default=["runs/v3_baseline/model.pt"])
     a = ap.parse_args()
     if a.test:
         return test(a)
+    if a.export:
+        return export(a)
 
     dev = get_device()
     ds1, ds1n = load("data/ds1.npz"), load("data_norm/ds1.npz")  # DS2 never loaded

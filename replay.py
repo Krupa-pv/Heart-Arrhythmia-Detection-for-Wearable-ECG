@@ -36,8 +36,11 @@ def export(a):
     assert len(d["y"]), f"record {a.rec} not in DS2"
     os.makedirs(a.out, exist_ok=True)
     path = f"{a.out}/{a.rec}.json"
-    json.dump({"rec": a.rec, "t": d["t"].tolist(), "y": d["y"].tolist(),
-               "rr": d["rr"].tolist(), "x": d["x"].tolist()}, open(path, "w"))
+    dn = load("data_norm/ds2.npz")  # v3 timing model features, same beat order
+    rr_norm = dn["rr"][ds2["rec"] == a.rec]
+    assert (dn["t"][ds2["rec"] == a.rec] == d["t"]).all()
+    json.dump({"rec": a.rec, "t": d["t"].tolist(), "y": d["y"].tolist(), "rr": d["rr"].tolist(),
+               "rr_norm": rr_norm.tolist(), "x": d["x"].tolist()}, open(path, "w"))
     print(f"wrote {path}  ({len(d['y'])} beats)")
 
 
@@ -130,9 +133,44 @@ def check_finetune(a):
               f"   enroll.py {ref:.4f}")
 
 
+def check_v3(a):
+    """swift v3 vs python fusion.py on the same record"""
+    from fusion import fuse, log_probs, rr_models  # noqa: F401  (fuse is the reference)
+    from train import VAL_RECS
+    ds2, dn = load(f"{a.data}/ds2.npz"), load("data_norm/ds2.npz")
+    m = ds2["rec"] == a.rec
+    d = subset(ds2, m)
+    X2 = dn["rr"][m]
+    sw = json.load(open(f"{a.out}/{a.rec}_v3.json"))
+    p_sw = np.array(sw["pred"])
+
+    # rebuild the exact timing model fusion.py used, and the CNN
+    ds1, ds1n = load(f"{a.data}/ds1.npz"), load("data_norm/ds1.npz")
+    tr = ~np.isin(ds1["rec"], VAL_RECS)
+    sc, binary, multi = rr_models(ds1n["rr"][tr], ds1["y"][tr])
+    w = json.load(open(a.v3_consts))["w"]
+    model = BeatNet()
+    model.load_state_dict(torch.load(a.v3_ckpt, map_location="cpu"))
+
+    # 1. same embeddings (swift's), python head + timing model
+    e_sw = torch.from_numpy(np.array(sw["embedding"], np.float32))
+    with torch.no_grad():
+        lp_same = torch.log_softmax(model.head(torch.cat([e_sw, torch.from_numpy(d["rr"])], 1)), 1).numpy()
+    p_same = fuse(lp_same, sc, binary, multi, X2, "multi", w)
+    print(f"1. head + timing model, swift vs python on swift embeddings: {(p_sw == p_same).mean():.5f} agree "
+          f"({(p_sw != p_same).sum()} differ)")
+    # 2. end to end vs pytorch
+    p_pt = fuse(log_probs(model, d, "cpu"), sc, binary, multi, X2, "multi", w)
+    ref = json.load(open(a.v3_results))["per_ckpt"][a.v3_ckpt]["per_patient"][str(a.rec)]["macro_f1"]
+    print(f"2. end to end, swift (fp16 core ml) vs pytorch: {(p_sw == p_pt).mean():.5f} agree "
+          f"({(p_sw != p_pt).sum()} of {len(p_sw)} differ)")
+    print(f"   macro-F1  swift {report(d['y'], p_sw)['macro_f1']:.4f}   python {report(d['y'], p_pt)['macro_f1']:.4f}"
+          f"   fusion.py ds2.json {ref:.4f}")
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["export", "check", "finetune"])
+    ap.add_argument("cmd", choices=["export", "check", "finetune", "v3"])
     ap.add_argument("--rec", type=int, default=214)
     ap.add_argument("--data", default="data")
     ap.add_argument("--out", default="runs/replay")
@@ -140,8 +178,11 @@ def main():
     ap.add_argument("--results", default="runs/enroll/results.json")
     ap.add_argument("--ckpt", default="runs/baseline/model.pt")
     ap.add_argument("--mlpackage", default="runs/coreml/ecg_embedding_fp16.mlpackage")
+    ap.add_argument("--v3-ckpt", default="runs/v3_baseline/model.pt")
+    ap.add_argument("--v3-consts", default="runs/fusion/v3_constants.json")
+    ap.add_argument("--v3-results", default="runs/fusion/ds2.json")
     a = ap.parse_args()
-    {"export": export, "check": check, "finetune": check_finetune}[a.cmd](a)
+    {"export": export, "check": check, "finetune": check_finetune, "v3": check_v3}[a.cmd](a)
 
 
 if __name__ == "__main__":
