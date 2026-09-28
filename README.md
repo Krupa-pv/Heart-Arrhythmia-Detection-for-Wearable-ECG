@@ -12,8 +12,9 @@ record, not a live sensor.
 
 | | |
 |---|---|
-| Population model on unseen patients (DS2) | macro-F1 0.407 |
-| 60 s enrollment, no labels, prototype head | **+0.074 macro-F1**, 77% of the recoverable gap |
+| Population model on unseen patients (DS2) | macro-F1 0.407 (v2) → **0.499** with CNN + timing model (v3, 3 seeds) |
+| S / V sensitivity, v2 → v3 | S 0.06 → **0.33**, V 0.86 → **0.91** (3 seeds) |
+| 60 s enrollment, no labels, prototype head (v2) | **+0.074 macro-F1**, 77% of the recoverable gap, but see [v3](#v3-fixing-overtraining-and-adding-a-timing-model): part of it was v2 overtraining |
 | 60 s enrollment, no labels, head fine-tune | −0.030 (hurts, see below) |
 | Same enrollment with the 6-bit model | +0.071, 74% of the gap |
 | Enrollment on iPhone 15 Pro (60 s of beats) | **6.3 ms** prototype, 25 ms `MLUpdateTask` fine-tune |
@@ -96,6 +97,49 @@ chosen on it). The prototype gain holds without it: +0.071.
 ![enrollment curve](figures/enrollment_curve.png)
 
 ![per patient at 60 s](figures/per_patient_60s.png)
+
+## v3: fixing overtraining and adding a timing model
+
+v2 detected almost no S beats on new patients (sensitivity 0.08). Two things were wrong, both
+found with **patient-grouped 5-fold cross-validation on all 22 DS1 patients** (`cv.py`,
+`fusion.py`) instead of the 4 validation patients. DS2 was only used once, at the end, and the
+settings were fixed before that.
+
+**1. v2 was overtrained.** Pooled over folds and 3 seeds, the CV curve peaks at 3-7 epochs
+(macro-F1 0.393) and is lower by 30-36 epochs (0.365). v2's 4-patient validation picked epoch 33.
+v3 trains the same model for a fixed 4 epochs. On its own this raises DS2 macro-F1 from
+0.403 ± 0.031 to 0.445 ± 0.007 (3 seeds) and V F1 from 0.65 to 0.80, but S gets even worse (0.01).
+
+Tried and not kept (no CV gain over 3 seeds): shift/scale/noise augmentation + dropout on the
+embedding, per-patient RR normalization fed to the CNN, 1/count class weights.
+
+**2. The CNN ignores timing.** On its training patients it gets 99.9% S sensitivity from beat
+shape alone, so it never learns to use the RR features, and shape doesn't carry over to new
+patients. de Chazal got about 76% S with a linear model on mostly RR features. So v3 adds a
+separate **timing model**: logistic regression on 4 RR features normalized by the patient's own
+average RR over the past 5 minutes (causal, works live), class-balanced. Its log-probabilities are
+added to the CNN's with weight 3 (picked by CV from 0 to 100; CNN alone 0.404, timing alone
+0.484, combined 0.545 on DS1 CV).
+
+DS2, 3 CNN seeds (the timing model is the same for all):
+
+| | v2 | v3 CNN alone | **v3 CNN + timing** |
+|---|---|---|---|
+| Macro-F1 | 0.403 ± 0.031 | 0.445 ± 0.007 | **0.499** (0.477 / 0.488 / 0.532) |
+| S sens | 0.056 | 0.014 | **0.325** (0.22 / 0.31 / 0.45) |
+| S PPV | ~0.04 | ~0.04 | **0.30** |
+| V sens | 0.864 | 0.816 | **0.909** |
+| V PPV | ~0.57 | ~0.77 | 0.62 |
+
+The S gain isn't only record 232 (0.004 → 0.19-0.43): without 232, S sensitivity is 0.30-0.53
+(v2: 0.33), with low PPV (about 0.12). Still well below de Chazal's 76%, which used both ECG
+leads; we use MLII only.
+
+**What this means for enrollment.** On the better v3 CNN, 60 s of label-free prototype enrollment
+adds only +0.036 (0.400 → 0.436), and the enrolled prototype head no longer beats the plain linear
+head (0.442). A good part of v2's +0.074 was undoing v2's own overtraining (false alarms on N
+beats), not patient differences. Combining enrollment with the timing model, and moving v3 to
+the phone, is not done yet: everything under "On the phone" is still v2.
 
 ## On the phone
 
@@ -191,6 +235,10 @@ Each variant gets its own population baseline and oracle@300 ceiling.
 - **6-bit is free here.** It halves the size, moves embeddings by up to 0.24, and barely changes the
   enrollment gain (+0.071 vs +0.074) or the speed.
 
+- **The biggest problem wasn't cross-patient shift, it was how I picked the epoch.** 4 validation
+  patients picked epoch 33; cross-validation over all 22 DS1 patients says 4. And a CNN that can
+  memorize shapes will ignore timing features even when you hand them to it.
+
 ## What broke
 
 - PhysioNet returned a 502 halfway through the download, and the prep script only checked for one
@@ -212,6 +260,13 @@ python enroll.py       # Step B
 python convert.py      # Core ML + parity (macOS)
 python compressed.py   # FP16 vs 6-bit enrollment
 python updatable.py    # updatable head for MLUpdateTask
+
+# v3
+python prep.py --out data_norm --rr-norm long
+python cv.py --name base                          # patient-grouped CV on DS1
+python train.py --select last --epochs 4 --out runs/v3_baseline
+python fusion.py --seeds 0 1 2                    # pick the timing model + weight on DS1 CV
+python fusion.py --test                           # one DS2 check
 
 # Swift checks against Python (macOS)
 swift build -c release --package-path swift/ProtoHead
