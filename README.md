@@ -1,301 +1,214 @@
 # On-Device Personalized ECG Classifier
 
-A heartbeat classifier trained on other people's hearts does worse on a new person's heart.
-This project measures that gap on MIT-BIH with a proper inter-patient split, then tests whether a
-short per-patient enrollment, using no cardiologist labels, closes part of it, and runs that
-enrollment on an iPhone with Core ML.
+A small ECG classifier that tests two questions:
 
-**Research prototype, not a medical device.** Everything on the phone is a **replayed** MIT-BIH
-record, not a live sensor.
+1. How much does performance drop when a heartbeat model sees a completely new patient?
+2. Can a short, label-free enrollment period recover some of that drop on-device?
 
-## Results at a glance
+I tested this on the MIT-BIH Arrhythmia Database using an inter-patient split, then moved the model and enrollment pipeline to an iPhone with Core ML.
 
-| | |
-|---|---|
-| Population model on unseen patients (DS2) | macro-F1 0.407 (v2) → **0.499** with CNN + timing model (v3, 3 seeds) |
-| S / V sensitivity, v2 → v3 | S 0.06 → **0.33**, V 0.86 → **0.91** (3 seeds) |
-| 60 s enrollment, no labels, prototype head (v2) | **+0.074 macro-F1**, 77% of the recoverable gap, but see [v3](#v3-fixing-overtraining-and-adding-a-timing-model): part of it was v2 overtraining |
-| 60 s enrollment, no labels, head fine-tune | −0.030 (hurts, see below) |
-| Same enrollment with the 6-bit model | +0.071, 74% of the gap |
-| Enrollment on iPhone 15 Pro (60 s of beats) | **6.3 ms** prototype, 25 ms `MLUpdateTask` fine-tune |
-| Inference per beat on iPhone 15 Pro | about 0.04 ms, FP16 and 6-bit |
-| Model size | about 62 KB FP16, 32 KB 6-bit |
-| Swift / Core ML vs Python | same predictions (differences only from FP16 rounding) |
+> **Research prototype, not a medical device.** The iPhone app replays MIT-BIH records. It does not use a live ECG sensor.
 
-## The problem and the leakage trap
+## Main results
 
-If you split MIT-BIH beats at random, the same patient ends up in train and test and you score
-around 99%. That number measures memorizing patients, not generalizing. Here the split is the
-de Chazal inter-patient one: DS1 records train, DS2 records test, no record in both. Paced records
-(102, 104, 107, 217) are left out. The numbers below are lower than the random-split ones you see
-around, and that's the point.
+| Result | Value |
+|---|---:|
+| Population model on unseen patients | macro-F1 0.403 ± 0.031 (v2) |
+| v3 CNN + timing model | **macro-F1 0.499** |
+| S sensitivity, v2 → v3 | 0.056 → **0.325** |
+| V sensitivity, v2 → v3 | 0.864 → **0.909** |
+| 60 s label-free prototype enrollment, v2 | **+0.074 macro-F1** |
+| Same enrollment after fixing v2 overtraining | +0.036 |
+| v3 inference on iPhone 15 Pro | about **0.152 ms/beat** |
+| v2 prototype enrollment on iPhone, 60 s | **6.3 ms** |
+| v2 FP16 model size | 62.9 KB |
+| v2 6-bit model size | 32.5 KB |
 
-## Setup
+The main result changed as the project went on. The first version made personalization look stronger than it really was. After switching to patient-grouped cross-validation, I found that v2 had been trained too long. Fixing that improved the population model and reduced the benefit of enrollment.
 
-- MIT-BIH Arrhythmia Database, lead MLII, 360 Hz, AAMI classes N / S / V / F / Q.
-- Baseline wander removed with 200 ms + 600 ms median filters.
-- 256-sample window per beat (R peak at index 100), z-scored per beat.
-- 4 RR features per beat: pre-RR, post-RR, mean RR of the last 10 beats, pre / local ratio.
-  These go into the model. S beats are mostly told apart by timing, not shape.
-- Model: 4 conv blocks → global average pool → 64-d embedding, then one linear layer on
-  [embedding, RR]. Weighted cross-entropy (1/√count).
-- Epoch picked on 4 held-out DS1 patients (106, 118, 124, 223). DS2 is never used to choose anything.
-- Metric: macro-F1 over N, S, V, F (Q has 7 beats in DS2), plus per-class sensitivity and PPV.
-  Never accuracy: 89% of beats are N.
+That became one of the more useful findings from the project.
 
-## Step A: the gap
+For the full experiments, tables, parity checks, and failure analysis, see [`REPORT.md`](REPORT.md).
 
-Population model on all DS2 beats. **Macro-F1 0.407.**
+## Why the split matters
 
-| Class | Sens | PPV | Beats |
-|---|---|---|---|
-| N | 0.832 | 0.957 | 44218 |
-| S | 0.084 | 0.039 | 1836 |
-| V | 0.856 | 0.571 | 3219 |
-| F | 0.005 | 0.001 | 388 |
+A random beat-level split on MIT-BIH can put beats from the same patient in both training and test data. That makes it much easier for a model to recognize patient-specific patterns instead of generalizing to someone new.
 
-S is the weak class. Record 232 holds 1381 of the 1836 DS2 S beats, and the model gets almost
-none of them (1013 go to N, 363 to V), even though their RR ratio is clearly short (median 0.74
-vs 1.76 for that record's N beats). Leaving 232 out, S sensitivity is 0.327.
+This project uses the de Chazal inter-patient split:
 
-## Step B: enrollment
+- DS1 records for training
+- DS2 records for testing
+- no patient record appears in both
+- paced records 102, 104, 107, and 217 are excluded
 
-For each DS2 patient, enroll on the first 30 s / 60 s / 2 min / 5 min, and test on every beat
-after 5 min. The test beats are the same for every length, and enrollment beats never touch them.
+The scores are much lower than the ~99% numbers often seen with random beat splits, but that is the point: DS2 is made of patients the model has not seen before.
 
-Two methods, backbone frozen in both:
-- **Fine-tune:** plain full-batch SGD on the linear head only, 30 steps, no regularizer (exactly
-  what `MLUpdateTask` can do on device).
-- **Prototype head:** class prototypes = class means of [embedding, RR] on DS1 train, scaled by
-  DS1 std. Enrollment blends the prototypes toward the patient's mean with weight α, then
-  classify by nearest prototype. α picked on DS1 val patients (0.5).
+## Model
 
-Two label conditions:
-- **Realistic:** every enrollment beat labeled N, since a phone gets no annotations. This is the
-  headline.
-- **Oracle:** true MIT-BIH labels. Upper bound.
+Each beat uses:
 
-Control: random labels at 60 s. It should not help, and it doesn't.
+- a 256-sample MLII waveform window, with the R peak at index 100
+- per-beat z-score normalization
+- four RR features:
+  - pre-RR
+  - post-RR
+  - mean RR over the previous 10 beats
+  - pre-RR / local RR ratio
 
-**Recovered share = (enrolled − population) / (oracle 5 min − population)**, on pooled macro-F1,
-with each method's own baseline and ceiling.
+The CNN has four convolution blocks followed by global average pooling and a 64-dimensional embedding. A linear head gets the embedding plus the RR features.
 
-| Condition (60 s) | Macro-F1 | Change | V sens | S sens | Recovered |
-|---|---|---|---|---|---|
-| Prototype, population | 0.402 | | 0.908 | 0.084 | |
-| Prototype, realistic | 0.476 | **+0.074** | 0.874 | 0.057 | 77% |
-| Prototype, oracle 5 min (ceiling) | 0.499 | +0.097 | 0.945 | 0.139 | 100% |
-| Prototype, random labels | 0.368 | −0.034 | 0.895 | 0.138 | |
-| Fine-tune, population | 0.411 | | 0.853 | 0.094 | |
-| Fine-tune, realistic | 0.380 | −0.030 | 0.350 | 0.054 | −14% |
-| Fine-tune, oracle 5 min (ceiling) | 0.628 | +0.217 | 0.835 | 0.646 | 100% |
-| Fine-tune, random labels | 0.255 | −0.156 | 0.810 | 0.172 | |
+The main metric is macro-F1 over N, S, V, and F. I also report sensitivity and PPV by class. Accuracy is not very useful here because about 89% of DS2 beats are N.
 
-`enroll.py` also prints every condition with record 232 left out (reporting only, nothing is
-chosen on it). The prototype gain holds without it: +0.071.
+## v2: label-free enrollment
 
-![enrollment curve](figures/enrollment_curve.png)
+For each DS2 patient, I used the first 30 seconds, 60 seconds, 2 minutes, or 5 minutes as an enrollment window and evaluated on beats after the 5-minute mark.
 
-![per patient at 60 s](figures/per_patient_60s.png)
+I compared two ways to adapt while keeping the backbone frozen:
 
-## v3: fixing overtraining and adding a timing model
+### Linear-head fine-tuning
 
-v2 detected almost no S beats on new patients (sensitivity 0.08). Two things were wrong, both
-found with **patient-grouped 5-fold cross-validation on all 22 DS1 patients** (`cv.py`,
-`fusion.py`) instead of the 4 validation patients. DS2 was only used once, at the end, and the
-settings were fixed before that.
+The phone treats every enrollment beat as N because there are no cardiologist annotations available during normal use.
 
-**1. v2 was overtrained.** Pooled over folds and 3 seeds, the CV curve peaks at 3-7 epochs
-(macro-F1 0.393) and is lower by 30-36 epochs (0.365). v2's 4-patient validation picked epoch 33.
-v3 trains the same model for a fixed 4 epochs. On its own this raises DS2 macro-F1 from
-0.403 ± 0.031 to 0.445 ± 0.007 (3 seeds) and V F1 from 0.65 to 0.80, but S gets even worse (0.01).
+Fine-tuning the linear head on those labels hurt performance:
 
-Tried and not kept (no CV gain over 3 seeds): shift/scale/noise augmentation + dropout on the
-embedding, per-patient RR normalization fed to the CNN, 1/count class weights.
+- population macro-F1: 0.411
+- after 60 s enrollment: 0.380
+- change: **-0.030**
 
-**2. The CNN ignores timing.** On its training patients it gets 99.9% S sensitivity from beat
-shape alone, so it never learns to use the RR features, and shape doesn't carry over to new
-patients. de Chazal got about 76% S with a linear model on mostly RR features. So v3 adds a
-separate **timing model**: logistic regression on 4 RR features normalized by the patient's own
-average RR over the past 5 minutes (causal, works live), class-balanced. Its log-probabilities are
-added to the CNN's with weight 3 (picked by CV from 0 to 100; CNN alone 0.404, timing alone
-0.484, combined 0.545 on DS1 CV).
+It mostly teaches the model to predict N more often.
 
-DS2, 3 CNN seeds (the timing model is the same for all):
+### Prototype adaptation
 
-| | v2 | v3 CNN alone | **v3 CNN + timing** |
-|---|---|---|---|
-| Macro-F1 | 0.403 ± 0.031 | 0.445 ± 0.007 | **0.499** (0.477 / 0.488 / 0.532) |
-| S sens | 0.056 | 0.014 | **0.325** (0.22 / 0.31 / 0.45) |
-| S PPV | ~0.04 | ~0.04 | **0.30** |
-| V sens | 0.864 | 0.816 | **0.909** |
-| V PPV | ~0.57 | ~0.77 | 0.62 |
+The prototype method is more conservative. Instead of retraining the whole head, it moves the N class prototype toward the new patient's enrollment mean.
 
-The S gain isn't only record 232 (0.004 → 0.19-0.43): without 232, S sensitivity is 0.30-0.53
-(v2: 0.33), with low PPV (about 0.12). Still well below de Chazal's 76%, which used both ECG
-leads; we use MLII only.
+On v2:
 
-**What this means for enrollment.** On the better v3 CNN, 60 s of label-free prototype enrollment
-adds only +0.036 (0.400 → 0.436), and the enrolled prototype head no longer beats the plain linear
-head (0.442). A good part of v2's +0.074 was undoing v2's own overtraining (false alarms on N
-beats), not patient differences. Combining enrollment with the timing model is not done yet.
+- population macro-F1: 0.402
+- after 60 s enrollment: 0.476
+- change: **+0.074**
 
-**v3 on the phone.** `V3Classifier` in `swift/ProtoHead` runs the v3 Core ML embedding model, the
-CNN's last layer and the timing model in Swift (`fusion.py --export` writes the constants). On a
-Mac it matches Python on all 22 DS2 records (0 disagreements on the same embeddings, 6 of 49,668
-beats off end to end from FP16, per-record macro-F1 within 0.0007). On the iPhone 15 Pro, record
-214 gives identical predictions to the Mac, at 0.152 ms per beat for the whole thing (Core ML
-embedding + CNN head + timing model in Swift, CPU, Debug build, so the Swift math isn't
-optimized). The rest of "On the phone" below is v2.
+The improvement mostly came from reducing false positives, not from finding more arrhythmias.
 
-## On the phone
+## v3: fixing the population model
 
-Everything on-device lives in `swift/ProtoHead`, a Swift package used by both a Mac command line
-tool (for checking against Python) and the iPhone app in `ios/ECGReplay`.
+The original model was especially poor on S beats from unseen patients, so I went back to the training procedure.
 
-### Core ML conversion
+Two things stood out.
 
-- FP32 ML Program vs PyTorch on all DS2 beats: max logit difference 1.3e-5, argmax agreement 100%.
-- The phone gets only the **embedding** model (backbone), FP16 and 6-bit palettized.
-  The head runs in Swift (prototype) or as a separate updatable model (fine-tune).
+### 1. v2 was overtrained
 
-### Prototype head (adapted on-device)
+The first version used four DS1 validation patients and selected epoch 33.
 
-`EmbeddingModel` runs the Core ML embedding model one beat at a time, and `ProtoHead` appends the
-4 RR values, does the at-rest enrollment (N prototype blended toward the enrollment mean) and
-classifies by nearest prototype.
+Patient-grouped 5-fold cross-validation across all 22 DS1 patients showed that performance actually peaked around epochs 3-7. v3 therefore trains for a fixed four epochs.
 
-Checked on all 22 DS2 records on a Mac (FP16, CPU):
-- Swift embeddings = coremltools embeddings exactly.
-- Swift head vs Python head on the same embeddings: 100% same predictions.
-- End to end vs the PyTorch path in `enroll.py`: 10 of 41,459 test beats differ (FP16 rounding),
-  per-record macro-F1 within 0.001.
+That change alone raised DS2 macro-F1 from:
 
-On an iPhone 15 Pro (iOS 26.6.2), record 214 bundled in the app:
-- CPU only: `replay.py check` on the phone's saved output gives the same three results as the Mac.
-- All compute units: same per-class results (N 1613/1662, V 156/212). Enrollment, 76 beats (60 s)
-  embedded + N prototype update: **6.3 ms**. Model load 127 ms.
+- **0.403 ± 0.031** to
+- **0.445 ± 0.007**
 
-### Head fine-tune with `MLUpdateTask`
+### 2. The CNN was not using timing well
 
-`MLUpdateTask` only works on the old NeuralNetwork format, so `updatable.py` builds the head
-(Linear 68 → 5, softmax) as a NeuralNetwork with only the linear layer updatable, cross-entropy
-loss and plain SGD. Swift (`UpdatableHead`) runs it full batch, 30 steps, lr 0.01, same as
-`enroll.py`. The backbone stays in the ML Program embedding model.
+On its training patients, the CNN could classify S beats almost entirely from waveform shape, so it had little reason to use the RR features. Those shape patterns did not transfer well to new patients.
 
-Checked on all 22 DS2 records on a Mac, realistic@60 and oracle@300:
-- Updated weights, Core ML vs PyTorch on the same features: max difference 6e-8 (the update
-  itself moves them by about 0.1).
-- Predictions on the same features: identical, 0 differences.
-- End to end vs `enroll.py`: 25 of about 83,000 test predictions differ (FP16 embeddings),
-  macro-F1 within 0.004.
-- Update time on the Mac: about 30 ms for 60 s of beats, 120 ms for 5 min.
+I added a separate logistic-regression timing model using the four RR features normalized by the patient's recent average RR.
 
-On an iPhone 15 Pro (iOS 26.6.2), record 214: `replay.py finetune` on the phone's saved output
-gives the same results as the Mac (weights within 6e-8 of PyTorch, predictions identical, macro-F1
-equal to `enroll.py`). The update itself takes **25.4 ms** for 60 s of beats (76) and 70 ms for
-5 min (383), 30 SGD steps each, so the head is **trained on-device**.
+Combining the CNN and timing model produced:
 
-It works, but it's the method that doesn't help without labels (−0.030 at 60 s), so the
-prototype head is still the one to ship.
+| | v2 | v3 CNN | v3 CNN + timing |
+|---|---:|---:|---:|
+| Macro-F1 | 0.403 ± 0.031 | 0.445 ± 0.007 | **0.499** |
+| S sensitivity | 0.056 | 0.014 | **0.325** |
+| V sensitivity | 0.864 | 0.816 | **0.909** |
 
-### Latency (Xcode performance report, iPhone 15 Pro, iOS 26.6.2, batch 1)
+This also changed how I interpret the enrollment result. With the better v3 CNN, 60 seconds of label-free prototype enrollment improves macro-F1 by only **+0.036** instead of +0.074.
 
-Predict time per beat, median / p95 over 120 predictions (40 x 3 runs):
+I have not yet combined the prototype enrollment method with the timing model.
 
-| Compute units | FP16 (62.9 KB) | 6-bit palettized (32.5 KB) |
-|---|---|---|
-| All | 0.040 / 0.062 ms | 0.039 / 0.062 ms |
-| CPU only | 0.044 / 0.067 ms | 0.042 / 0.070 ms |
-| CPU + GPU | 0.044 / 0.061 ms | 0.045 / 0.064 ms |
-| CPU + Neural Engine | 0.042 / 0.066 ms | 0.045 / 0.072 ms |
+## On-device
 
-Model load is about 6.5-6.8 ms in every case.
+The Core ML / Swift implementation lives in `swift/ProtoHead`, and the iPhone app is in `ios/ECGReplay`.
 
-### Does it survive compression?
+For v3, `V3Classifier` runs:
 
-`compressed.py` embeds every DS2 beat with the FP16 and 6-bit Core ML models (batch 1, CPU),
-then runs the prototype head with the same constants the phone ships (made from the FP32 model).
-Each variant gets its own population baseline and oracle@300 ceiling.
+- the Core ML embedding model
+- the CNN head in Swift
+- the RR timing model in Swift
 
-| Variant | Size | Population | Realistic 60 s | Change | Recovered | Oracle 5 min |
-|---|---|---|---|---|---|---|
-| PyTorch FP32 | | 0.402 | 0.476 | +0.074 | 76.7% | 0.499 |
-| Core ML FP16 | 62.9 KB | 0.402 | 0.476 | +0.074 | 76.8% | 0.499 |
-| Core ML 6-bit | 32.5 KB | 0.406 | 0.477 | +0.071 | 73.5% | 0.503 |
+On all 22 DS2 records, the Mac implementation matches Python on the same embeddings. End to end, only 6 of 49,668 predictions differ because of FP16 rounding.
 
-## What surprised me
+On an iPhone 15 Pro, record 214 gives the same predictions as the Mac. The full v3 path runs at about **0.152 ms per beat** on CPU in a Debug build.
 
-- **Label-free enrollment helps the prototype head and hurts fine-tuning.** Fine-tuning on
-  all-N labels teaches the head to call everything N, and V sensitivity falls from 0.85 to 0.35.
-  Moving only the N prototype doesn't have that problem.
-- **The prototype gain is fewer false alarms, not more arrhythmias found.** V PPV goes from 0.50 to
-  0.89, and S sensitivity actually drops a bit. The 77% is of a small ceiling (+0.097), so +0.074
-  macro-F1 is the more honest number.
-- **The prototype curve is flat from 30 s to 5 min.** 30 seconds of beats already gives the N mean.
-- **One record drives the fine-tune ceiling.** Without 232, the oracle fine-tune S sensitivity is
-  0.197, below the population model's 0.331. Most of the oracle's S gain is learning 232.
-- **The Neural Engine never gets used.** Every op is supported on it, but in all four settings,
-  including forced CPU + Neural Engine and CPU + GPU, Core ML placed all 17 ops on the CPU for
-  both models. The model is small enough that the scheduler decides the CPU is cheapest, so
-  there's no Neural Engine number for it.
-- **6-bit is free here.** It halves the size, moves embeddings by up to 0.24, and barely changes the
-  enrollment gain (+0.071 vs +0.074) or the speed.
+The v2 experiments also tested:
 
-- **The biggest problem wasn't cross-patient shift, it was how I picked the epoch.** 4 validation
-  patients picked epoch 33; cross-validation over all 22 DS1 patients says 4. And a CNN that can
-  memorize shapes will ignore timing features even when you hand them to it.
+- on-device prototype enrollment
+- `MLUpdateTask` head fine-tuning
+- FP16 vs 6-bit palettization
+- CPU / GPU / Neural Engine placement
 
-## What broke
+The detailed results are in [`REPORT.md`](REPORT.md).
 
-- PhysioNet returned a 502 halfway through the download, and the prep script only checked for one
-  file, so a rerun skipped the download and crashed. Now it checks all records.
-- 6-bit palettization needs scikit-learn (k-means), which wasn't in the requirements.
-- `MLUpdateTask` refused full-batch training: the model spec only allowed the mini-batch size it
-  was built with, and the number of enrollment beats is different for every patient. Fixed by
-  allowing a range (1-4096) in the spec.
-- A `data/` line in `.gitignore` also matched the `Data/` folder inside `.mlpackage` bundles
-  (macOS paths are case-insensitive), so the model weights silently didn't get committed.
+## Key takeaways
+
+- **Patient-level validation changed the conclusion.** Four held-out patients selected epoch 33; grouped cross-validation across all DS1 patients pointed to about epoch 4.
+- **Timing generalized better than waveform shape for S beats.** A separate RR model improved S sensitivity much more than the CNN alone.
+- **Naive label-free fine-tuning was a bad fit.** Treating every enrollment beat as normal pushed the classifier toward N and hurt V sensitivity.
+- **Prototype adaptation was more stable.** It adjusted the normal class without collapsing the rest of the classifier.
+- **Part of the original personalization gain was really a training problem.** Once the population model improved, the enrollment gain became smaller.
+- **The model is easy to run on-device.** The full v3 pipeline is well under 1 ms per beat on the tested iPhone.
+- **6-bit compression changed very little.** It roughly halved the v2 model size while keeping the enrollment result almost the same.
 
 ## Running it
 
-```
+```bash
 pip install -r requirements.txt
-python prep.py         # download MIT-BIH + preprocess
-python train.py        # Step A
-python enroll.py       # Step B
-python convert.py      # Core ML + parity (macOS)
-python compressed.py   # FP16 vs 6-bit enrollment
-python updatable.py    # updatable head for MLUpdateTask
 
-# v3
+python prep.py
+python train.py
+python enroll.py
+python convert.py
+python compressed.py
+python updatable.py
+```
+
+### v3
+
+```bash
 python prep.py --out data_norm --rr-norm long
-python cv.py --name base                          # patient-grouped CV on DS1
+python cv.py --name base
 python train.py --select last --epochs 4 --out runs/v3_baseline
-python fusion.py --seeds 0 1 2                    # pick the timing model + weight on DS1 CV
-python fusion.py --test                           # one DS2 check
+python fusion.py --seeds 0 1 2
+python fusion.py --test
+```
 
-# Swift checks against Python (macOS)
+### Swift parity checks
+
+```bash
 swift build -c release --package-path swift/ProtoHead
+
 python replay.py export --rec 214
-swift/ProtoHead/.build/release/replay runs/replay/214.json runs/coreml/ecg_embedding_fp16.mlpackage \
-    runs/enroll/proto_constants.json runs/replay/214_swift.json
+
+swift/ProtoHead/.build/release/replay \
+  runs/replay/214.json \
+  runs/coreml/ecg_embedding_fp16.mlpackage \
+  runs/enroll/proto_constants.json \
+  runs/replay/214_swift.json
+
 python replay.py check --rec 214
-swift/ProtoHead/.build/release/finetune runs/replay/214.json runs/coreml/ecg_embedding_fp16.mlpackage \
-    runs/coreml/ecg_head_updatable.mlmodel runs/replay/214_finetune.json
+
+swift/ProtoHead/.build/release/finetune \
+  runs/replay/214.json \
+  runs/coreml/ecg_embedding_fp16.mlpackage \
+  runs/coreml/ecg_head_updatable.mlmodel \
+  runs/replay/214_finetune.json
+
 python replay.py finetune --rec 214
 ```
 
-The iPhone app is `ios/ECGReplay`. It needs `214.json` (from `replay.py export`, not in the repo)
-added to the app target.
+The iPhone app is in `ios/ECGReplay`. It expects `214.json`, generated with `python replay.py export --rec 214`, to be added to the app target.
 
 ## Prior work
 
-This is not a new idea. Patient-specific ECG classification is well studied; the contribution
-here is doing it carefully and running it on-device.
+Patient-specific ECG classification is already well studied. The point of this project is not that personalization itself is new. I was interested in measuring it with a strict patient split, testing a no-label enrollment setup, and checking whether the same pipeline could actually run on-device.
 
-- P. de Chazal, M. O'Dwyer, R. B. Reilly. *Automatic classification of heartbeats using ECG
-  morphology and heartbeat interval features.* IEEE TBME 51(7), 2004. (the inter-patient split)
-- S. Kiranyaz, T. Ince, M. Gabbouj. *Real-time patient-specific ECG classification by 1-D
-  convolutional neural networks.* IEEE TBME 63(3), 2016. (patient-specific 1D CNN, first 5 min
-  of each record)
+- P. de Chazal, M. O'Dwyer, R. B. Reilly. *Automatic classification of heartbeats using ECG morphology and heartbeat interval features.* IEEE TBME 51(7), 2004.
+- S. Kiranyaz, T. Ince, M. Gabbouj. *Real-time patient-specific ECG classification by 1-D convolutional neural networks.* IEEE TBME 63(3), 2016.
